@@ -158,6 +158,4 @@ IMAGE_UPLOAD_PROVIDERS=catbox,litterbox,pixeldrain npm start
   - Normal if another provider wins the upload race.
 
 ## Notes
-
-- `config.json` and `image-cache.json` are gitignored.
 - Album art is uploaded to third-party services you enable; choose providers based on your privacy and retention preferences.
