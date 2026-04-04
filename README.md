@@ -32,6 +32,7 @@ Display your currently playing music from **Roon** or **Audirvana Studio** as Di
 ## Install
 
 ```bash
+git clone https://github.com/reiserFSs/discordroonaudirvanarpc
 npm install
 cp config.example.json config.json
 ```
