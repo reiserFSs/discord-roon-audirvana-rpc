@@ -15,7 +15,7 @@ Display your currently playing music from **Roon** or **Audirvana Studio** as Di
   - Album name (as image hover text)
   - Playback progress (elapsed + remaining time bar in Discord)
   - Zone label (`Zone: <name>`) as small-image text
-- Resolves album art and uploads it to public image hosts so Discord can display it.
+- Resolves album art, hashes and uploads it to public image hosts so Discord can display it. Functional album art cache, so images don't get uploaded twice (checks against hash)
   - `roon`: Album art from local and all streaming services supported
   - `audirvana`: Album art from local and TIDAL supported
 
