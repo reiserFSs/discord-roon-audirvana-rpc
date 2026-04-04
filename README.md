@@ -1,4 +1,4 @@
-# roon-discord-rpc
+# roon-audirvana-discord-rpc
 
 Display your currently playing music from **Roon** or **Audirvana Studio** as Discord Rich Presence.
 
