@@ -2,6 +2,8 @@
 
 Display your currently playing music from **Roon** or **Audirvana Studio** as Discord Rich Presence.
 
+<img width="433" height="142" alt="image" src="https://github.com/user-attachments/assets/fcecf592-ac04-40d3-b491-5de0732f4808" />
+
 ## What It Does
 
 - Connects to Discord RPC and updates your status while music is playing.
