@@ -1,0 +1,20 @@
+{
+  "name": "roon-discord-rpc",
+  "version": "1.0.0",
+  "description": "Display currently playing music from Roon or Audirvana Studio as Discord Rich Presence",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --dns-result-order=ipv4first index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@roonlabs/node-roon-api": "^1.0.0",
+    "node-roon-api-transport": "github:roonlabs/node-roon-api-transport",
+    "node-roon-api-image": "github:roonlabs/node-roon-api-image",
+    "@xhayper/discord-rpc": "^1.2.0",
+    "discord-api-types": "^0.37.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

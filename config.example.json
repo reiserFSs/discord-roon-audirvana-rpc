@@ -1,0 +1,7 @@
+{
+  "discord_application_id": "YOUR_DISCORD_APPLICATION_ID",
+  "player": "roon",
+  "zone_name": "",
+  "audirvana_poll_interval_ms": 2000,
+  "pause_clear_after_ms": 0
+}
