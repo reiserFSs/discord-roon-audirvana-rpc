@@ -15,6 +15,7 @@ const UPLOAD_FAILURE_COOLDOWN_MS = Number(process.env.IMAGE_UPLOAD_FAILURE_COOLD
 const NO_BUFFER_FAILURE_COOLDOWN_MS = Number(process.env.IMAGE_UPLOAD_NO_BUFFER_COOLDOWN_MS || 10_000);
 const IMAGE_BUFFER_FETCH_RETRIES = Number(process.env.IMAGE_BUFFER_FETCH_RETRIES || 3);
 const IMAGE_BUFFER_FETCH_RETRY_MS = Number(process.env.IMAGE_BUFFER_FETCH_RETRY_MS || 1_500);
+const IMAGE_URL_FETCH_MAX_BYTES = Number(process.env.IMAGE_URL_FETCH_MAX_BYTES || 8 * 1024 * 1024);
 const IMAGE_UPLOAD_CONNECT_TIMEOUT_MS = Number(process.env.IMAGE_UPLOAD_CONNECT_TIMEOUT_MS || 30_000);
 const UPLOAD_USER_AGENT = process.env.IMAGE_UPLOAD_USER_AGENT || "curl/8.7.1";
 const IMAGE_UPLOAD_PROVIDERS = (process.env.IMAGE_UPLOAD_PROVIDERS || "catbox,litterbox,telegraph,fileio")
@@ -225,20 +226,60 @@ function mergeSignals(signalA, signalB) {
   return signalA || signalB;
 }
 
+async function readResponseBuffer(response, maxBytes) {
+  if (!response?.body || typeof response.body.getReader !== "function") {
+    const full = Buffer.from(await response.arrayBuffer());
+    return full.subarray(0, Math.min(full.length, maxBytes));
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+
+      const remaining = maxBytes - total;
+      const chunk = Buffer.from(value);
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      chunks.push(slice);
+      total += slice.length;
+
+      if (total >= maxBytes) {
+        await reader.cancel();
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, total);
+}
+
 function queueUpload(task) {
   const next = uploadQueue.then(task, task);
   uploadQueue = next.catch(() => {});
   return next;
 }
 
-async function resolveImageBufferWithRetries(imageBufferFn) {
+async function resolveImageBufferWithRetries(imageBufferFn, options = {}) {
   let lastBuffer = null;
-  const attempts = Math.max(1, IMAGE_BUFFER_FETCH_RETRIES);
+  const shouldContinue = typeof options.shouldContinue === "function"
+    ? options.shouldContinue
+    : () => true;
+  const attempts = Math.max(1, Number(options.maxAttempts) || IMAGE_BUFFER_FETCH_RETRIES);
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (!shouldContinue()) {
+      return { buffer: null, skipped: true };
+    }
+
     const buffer = await imageBufferFn();
     if (buffer && Buffer.isBuffer(buffer) && buffer.length > 0) {
-      return buffer;
+      return { buffer, skipped: false };
     }
     lastBuffer = buffer;
 
@@ -247,7 +288,7 @@ async function resolveImageBufferWithRetries(imageBufferFn) {
     }
   }
 
-  return lastBuffer;
+  return { buffer: lastBuffer, skipped: false };
 }
 
 function getFailureState(imageKey) {
@@ -268,9 +309,10 @@ function getFailureCooldownMs(reason) {
   return UPLOAD_FAILURE_COOLDOWN_MS;
 }
 
-function shouldSkipForRecentFailure(imageKey) {
+function shouldSkipForRecentFailure(imageKey, ignoredReasons = []) {
   const state = getFailureState(imageKey);
   if (!state) return false;
+  if (ignoredReasons.includes(state.reason)) return false;
   return Date.now() - state.at < getFailureCooldownMs(state.reason);
 }
 
@@ -828,15 +870,90 @@ async function uploadUrlToAnyProvider(sourceUrl, imageKey, maxRetries, timeoutMs
   });
 }
 
-async function getOrUpload(imageKey, imageBufferFn) {
+async function fetchImageBufferFromUrl(sourceUrl, imageKey, timeoutMs) {
+  const value = String(sourceUrl || "").trim();
+  if (!/^https?:\/\//i.test(value)) return null;
+
+  try {
+    const res = await fetch(value, {
+      headers: {
+        accept: "image/*,*/*;q=0.8",
+        "user-agent": UPLOAD_USER_AGENT,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) {
+      logger.warn("Album art source URL fetch failed", {
+        imageKey,
+        sourceUrl: value,
+        status: res.status,
+        statusText: res.statusText,
+      });
+      return null;
+    }
+
+    const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+    if (contentType && !contentType.startsWith("image/")) {
+      logger.warn("Album art source URL returned non-image content", {
+        imageKey,
+        sourceUrl: value,
+        contentType,
+      });
+      return null;
+    }
+
+    const buffer = await readResponseBuffer(res, IMAGE_URL_FETCH_MAX_BYTES);
+    return buffer?.length ? buffer : null;
+  } catch (err) {
+    logger.warn("Album art source URL fetch error", { imageKey, sourceUrl: value, ...getErrorDetails(err) });
+    return null;
+  }
+}
+
+async function uploadResolvedImageBuffer(imageKey, buffer) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+
+  const bufferHash = hashImageBuffer(buffer);
+  const existingByHash = findCachedUrlByHash(bufferHash);
+  if (existingByHash) {
+    uploadFailures.delete(imageKey);
+    touchCacheEntry(imageKey, { url: existingByHash, updatedAt: Date.now(), hash: bufferHash });
+    pruneCache();
+    scheduleSave();
+    loggedCacheHits.add(imageKey);
+    logger.info("Album art hash cache hit", { imageKey, hash: bufferHash, url: existingByHash });
+    return existingByHash;
+  }
+
+  const url = await uploadToAnyProvider(buffer, imageKey, IMAGE_UPLOAD_MAX_RETRIES, IMAGE_UPLOAD_TIMEOUT_MS);
+  if (!url) return null;
+
+  uploadFailures.delete(imageKey);
+  touchCacheEntry(imageKey, { url, updatedAt: Date.now(), hash: bufferHash });
+  pruneCache();
+  scheduleSave();
+  return url;
+}
+
+async function getOrUpload(imageKey, imageBufferFn, options = {}) {
   if (!imageKey) return null;
+  const shouldContinue = typeof options.shouldContinue === "function"
+    ? options.shouldContinue
+    : () => true;
+  const maxBufferAttempts = Math.max(1, Number(options.maxBufferAttempts) || IMAGE_BUFFER_FETCH_RETRIES);
+  const ignoredFailureReasons = Array.isArray(options.ignoredFailureReasons)
+    ? options.ignoredFailureReasons
+    : [];
+  const markNoBufferFailure = options.markNoBufferFailure !== false;
+  const logNoBuffer = options.logNoBuffer !== false;
 
   const cached = getCachedUrl(imageKey);
   if (cached) {
     return cached;
   }
 
-  if (shouldSkipForRecentFailure(imageKey)) {
+  if (shouldSkipForRecentFailure(imageKey, ignoredFailureReasons)) {
     return null;
   }
 
@@ -847,33 +964,28 @@ async function getOrUpload(imageKey, imageBufferFn) {
 
   const uploadPromise = queueUpload(async () => {
     try {
-      const buffer = await resolveImageBufferWithRetries(imageBufferFn);
+      if (!shouldContinue()) return null;
+
+      const { buffer, skipped } = await resolveImageBufferWithRetries(imageBufferFn, {
+        maxAttempts: maxBufferAttempts,
+        shouldContinue,
+      });
+      if (skipped) return null;
+
       if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
-        markFailure(imageKey, "no-buffer");
-        logger.warn("No usable album art buffer available", { imageKey });
+        if (markNoBufferFailure) {
+          markFailure(imageKey, "no-buffer");
+        }
+        if (logNoBuffer) {
+          logger.warn("No usable album art buffer available", { imageKey });
+        }
         return null;
       }
 
-      const bufferHash = hashImageBuffer(buffer);
-      const existingByHash = findCachedUrlByHash(bufferHash);
-      if (existingByHash) {
-        uploadFailures.delete(imageKey);
-        touchCacheEntry(imageKey, { url: existingByHash, updatedAt: Date.now(), hash: bufferHash });
-        pruneCache();
-        scheduleSave();
-        logger.info("Album art hash cache hit", { imageKey, hash: bufferHash, url: existingByHash });
-        return existingByHash;
-      }
+      if (!shouldContinue()) return null;
 
-      const url = await uploadToAnyProvider(buffer, imageKey, IMAGE_UPLOAD_MAX_RETRIES, IMAGE_UPLOAD_TIMEOUT_MS);
-
-      if (url) {
-        uploadFailures.delete(imageKey);
-        touchCacheEntry(imageKey, { url, updatedAt: Date.now(), hash: bufferHash });
-        pruneCache();
-        scheduleSave();
-        return url;
-      }
+      const url = await uploadResolvedImageBuffer(imageKey, buffer);
+      if (url) return url;
 
       markFailure(imageKey, "upload-failed");
       logger.error("All upload services failed", { imageKey });
@@ -895,13 +1007,16 @@ async function getOrUpload(imageKey, imageBufferFn) {
   }
 }
 
-async function getOrUploadFromUrl(imageKey, sourceUrl) {
+async function getOrUploadFromUrl(imageKey, sourceUrl, options = {}) {
   if (!imageKey || !sourceUrl) return null;
+  const shouldContinue = typeof options.shouldContinue === "function"
+    ? options.shouldContinue
+    : () => true;
 
   const cached = getCachedUrl(imageKey);
   if (cached) return cached;
 
-  if (shouldSkipForRecentFailure(imageKey)) {
+  if (shouldSkipForRecentFailure(imageKey, ["no-buffer"])) {
     return null;
   }
 
@@ -912,13 +1027,16 @@ async function getOrUploadFromUrl(imageKey, sourceUrl) {
 
   const uploadPromise = queueUpload(async () => {
     try {
-      const url = await uploadUrlToAnyProvider(sourceUrl, imageKey, IMAGE_UPLOAD_MAX_RETRIES, IMAGE_UPLOAD_TIMEOUT_MS);
-      if (url) {
-        uploadFailures.delete(imageKey);
-        touchCacheEntry(imageKey, { url, updatedAt: Date.now() });
-        pruneCache();
-        scheduleSave();
-        return url;
+      if (!shouldContinue()) return null;
+
+      const buffer = await fetchImageBufferFromUrl(sourceUrl, imageKey, IMAGE_UPLOAD_TIMEOUT_MS);
+      if (!shouldContinue()) return null;
+
+      const uploadedBufferUrl = await uploadResolvedImageBuffer(imageKey, buffer);
+      if (uploadedBufferUrl) return uploadedBufferUrl;
+
+      if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+        logger.warn("No usable album art URL buffer available", { imageKey, sourceUrl });
       }
 
       markFailure(imageKey, "url-upload-failed");
@@ -945,4 +1063,25 @@ function getCached(imageKey) {
   return getCachedUrl(imageKey);
 }
 
-module.exports = { getOrUpload, getOrUploadFromUrl, getCached };
+function resetForTest(entries = []) {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  saveInFlight = false;
+  pendingSave = false;
+  cache = new Map(entries);
+  loggedCacheHits.clear();
+  inFlightUploads.clear();
+  uploadFailures.clear();
+  uploadQueue = Promise.resolve();
+}
+
+module.exports = {
+  getOrUpload,
+  getOrUploadFromUrl,
+  getCached,
+  __test: {
+    resetForTest,
+  },
+};

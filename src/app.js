@@ -4,10 +4,15 @@ const discord = require("./discord");
 const imageHost = require("./image-host");
 const logger = require("./logger");
 
+const TIDAL_PERSISTED_ART_RETRY_MS = Number(process.env.AUDIRVANA_TIDAL_ART_RETRY_MS || 2_000);
+const TIDAL_PERSISTED_ART_RETRY_TIMEOUT_MS = Number(process.env.AUDIRVANA_TIDAL_ART_RETRY_TIMEOUT_MS || 5 * 60_000);
+
 let config = null;
 let currentZoneId = null;
+let currentArtworkImageKey = null;
 let zonesById = new Map();
 let updateVersion = 0;
+const delayedTidalArtworkLookups = new Map();
 
 async function start(cfg) {
   config = cfg;
@@ -52,6 +57,7 @@ function handleZoneEvent(event, data) {
     case "Unsubscribed":
     case "Unpaired":
       currentZoneId = null;
+      currentArtworkImageKey = null;
       zonesById.clear();
       updateVersion += 1;
       discord.clearActivity();
@@ -65,6 +71,7 @@ function handleZoneEvent(event, data) {
 function handleAudirvanaSnapshot(snapshot) {
   if (!snapshot?.running) {
     currentZoneId = null;
+    currentArtworkImageKey = null;
     updateVersion += 1;
     discord.clearActivity();
     return;
@@ -164,6 +171,10 @@ function buildAudirvanaImageKey(snapshot) {
       host = "";
     }
 
+    if (/audio\.tidal\.com$/i.test(host)) {
+      return `audirvana-stream-track:${host}:${normalizedTrackUrl}`;
+    }
+
     const albumIdentity = [albumName.toLowerCase(), artist.toLowerCase()]
       .filter(Boolean)
       .join("|");
@@ -217,17 +228,74 @@ function normalizeSeconds(rawValue, options = {}) {
   return Math.round(seconds);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTidalStreamUrl(trackUrl) {
+  return /audio\.tidal\.com/i.test(String(trackUrl || ""));
+}
+
+async function getDelayedAudirvanaTidalArtworkUrl({ imageKey, imageContext, shouldContinue }) {
+  const existingLookup = delayedTidalArtworkLookups.get(imageKey);
+  if (existingLookup) return existingLookup;
+
+  const lookup = runDelayedAudirvanaTidalArtworkUrl({ imageKey, imageContext, shouldContinue });
+  delayedTidalArtworkLookups.set(imageKey, lookup);
+  try {
+    return await lookup;
+  } finally {
+    if (delayedTidalArtworkLookups.get(imageKey) === lookup) {
+      delayedTidalArtworkLookups.delete(imageKey);
+    }
+  }
+}
+
+async function runDelayedAudirvanaTidalArtworkUrl({ imageKey, imageContext, shouldContinue }) {
+  const retryMs = Math.max(500, TIDAL_PERSISTED_ART_RETRY_MS);
+  const timeoutMs = Math.max(retryMs, TIDAL_PERSISTED_ART_RETRY_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  while (shouldContinue() && Date.now() - startedAt < timeoutMs) {
+    await sleep(retryMs);
+    if (!shouldContinue()) return null;
+
+    const albumArtUrl = await imageHost.getOrUpload(imageKey, () => audirvana.getPersistedImage(imageContext), {
+      ignoredFailureReasons: ["no-buffer"],
+      logNoBuffer: false,
+      markNoBufferFailure: false,
+      maxBufferAttempts: 1,
+      shouldContinue,
+    });
+    if (albumArtUrl) {
+      logger.debug("Audirvana delayed Tidal artwork resolved", {
+        imageKey,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return albumArtUrl;
+    }
+  }
+
+  logger.debug("Audirvana delayed Tidal artwork unresolved", {
+    imageKey,
+    elapsedMs: Date.now() - startedAt,
+  });
+  return null;
+}
+
 async function processZone(zone) {
   const version = ++updateVersion;
   currentZoneId = zone.zone_id;
 
   if (zone.state !== "playing") {
+    currentArtworkImageKey = null;
     discord.clearActivity();
     return;
   }
 
   const nowPlaying = zone.now_playing;
   if (!nowPlaying) {
+    currentArtworkImageKey = null;
     discord.clearActivity();
     return;
   }
@@ -236,6 +304,7 @@ async function processZone(zone) {
   const artist = nowPlaying.three_line?.line2 || "Unknown Artist";
   const albumName = nowPlaying.three_line?.line3 || "Unknown Album";
   const imageKey = nowPlaying.image_key;
+  currentArtworkImageKey = imageKey || null;
   const trackUrl = nowPlaying.track_url || null;
   const seekPosition = normalizeSeconds(zone.seek_position ?? nowPlaying.seek_position ?? 0, { allowZero: true }) ?? 0;
   const length = normalizeSeconds(nowPlaying.length);
@@ -264,20 +333,30 @@ async function processZone(zone) {
 
   if (player === "audirvana" && imageKey && !cachedAlbumArtUrl) {
     void (async () => {
-      let albumArtUrl = null;
-      albumArtUrl = await imageHost.getOrUpload(imageKey, () => audirvana.getImage({
+      const isCurrentArtwork = () => currentArtworkImageKey === imageKey;
+      const imageContext = {
         trackUrl: trackUrl || "",
         title,
         artist,
         albumName,
         directAlbumArtUrl: directAlbumArtUrl || "",
-      }));
+      };
+      let albumArtUrl = null;
+      albumArtUrl = await imageHost.getOrUpload(imageKey, () => audirvana.getImage(imageContext), { maxBufferAttempts: 1, shouldContinue: isCurrentArtwork });
+      if (!isCurrentArtwork()) return;
       if (!albumArtUrl && directAlbumArtUrl) {
-        albumArtUrl = await imageHost.getOrUploadFromUrl(imageKey, directAlbumArtUrl);
+        albumArtUrl = await imageHost.getOrUploadFromUrl(imageKey, directAlbumArtUrl, { shouldContinue: isCurrentArtwork });
+      }
+      if (!albumArtUrl && isTidalStreamUrl(trackUrl)) {
+        albumArtUrl = await getDelayedAudirvanaTidalArtworkUrl({
+          imageKey,
+          imageContext,
+          shouldContinue: isCurrentArtwork,
+        });
       }
       if (!albumArtUrl) return;
 
-      if (version !== updateVersion) return;
+      if (!isCurrentArtwork()) return;
 
       discord.updateActivity({
         ...baseActivity,

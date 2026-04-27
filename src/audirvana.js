@@ -529,6 +529,15 @@ async function getImage(context = "") {
     trackUrl: normalizeTrackUrlForIdentity(candidateTrackUrl),
   });
 
+  if (/audio\.tidal\.com/i.test(candidateTrackUrl)) {
+    logger.debug("Audirvana artwork source skipped", {
+      source: "remote-flac-embedded",
+      reason: "tidal-stream-no-embedded-artwork",
+      trackUrl: normalizeTrackUrlForIdentity(candidateTrackUrl),
+    });
+    return null;
+  }
+
   const artworkFromRemote = await readRemoteArtworkFromTrackUrl(candidateTrackUrl);
   if (artworkFromRemote) {
     logger.debug("Audirvana artwork source hit", { source: "remote-flac-embedded" });
@@ -538,6 +547,34 @@ async function getImage(context = "") {
   logger.debug("Audirvana artwork source miss", {
     source: "remote-flac-embedded",
     trackUrl: normalizeTrackUrlForIdentity(candidateTrackUrl),
+  });
+  return null;
+}
+
+async function getPersistedImage(context = {}) {
+  const imageContext = typeof context === "string"
+    ? { trackUrl: context }
+    : (context || {});
+  const persistedContext = {
+    ...imageContext,
+    directAlbumArtUrl: "",
+  };
+  const trackUrl = String(persistedContext.trackUrl || "").trim();
+
+  const artworkFromWebkitCache = await readWebkitCachedArtworkFromContext(persistedContext);
+  if (artworkFromWebkitCache) {
+    logger.debug("Audirvana artwork source hit", { source: "webkit-cache-persisted" });
+    return artworkFromWebkitCache;
+  }
+
+  const artworkFromDbUrl = await readRemoteArtworkFromContext(persistedContext, trackUrl);
+  if (artworkFromDbUrl) {
+    logger.debug("Audirvana artwork source hit", { source: "audirvana-db-url-persisted" });
+    return artworkFromDbUrl;
+  }
+
+  logger.debug("Audirvana persisted artwork source miss", {
+    trackUrl: normalizeTrackUrlForIdentity(trackUrl),
   });
   return null;
 }
@@ -825,6 +862,15 @@ function extractArtworkUrlsFromTrackUrl(trackUrl) {
   const normalized = String(trackUrl || "").trim();
   if (!normalized) return [];
   if (!/audio\.tidal\.com/i.test(normalized)) return [];
+
+  try {
+    const parsed = new URL(normalized);
+    if (/audio\.tidal\.com$/i.test(parsed.hostname) && parsed.pathname.includes("/mediatracks/")) {
+      return [];
+    }
+  } catch {
+    // Fall through to generic text extraction.
+  }
 
   const ids = [];
   ids.push(...extractTidalIdsFromText(normalized));
@@ -1468,6 +1514,7 @@ module.exports = {
   init,
   stop,
   getImage,
+  getPersistedImage,
   getDirectArtworkUrlFromTrackUrl,
   __test: {
     resolvePollIntervalMs,
